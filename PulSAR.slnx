@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="PulSAR.Console/PulSAR.Console.csproj" />
+  <Project Path="PulSAR.Core/PulSAR.Core.csproj" />
+  <Project Path="PulSAR.Training/PulSAR.Training.csproj" />
+</Solution>
