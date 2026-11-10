@@ -35,7 +35,7 @@ public class Classifier
     {
         DebugObject dObject = new DebugObject();
         // Create the tokenizer 
-        var tokenizer = BertTokenizer.Create(model_path + "vocab.txt", new BertOptions
+        var tokenizer = BertTokenizer.Create($"{model_path}vocab.txt", new BertOptions
         {
             LowerCaseBeforeTokenization = false
         });
