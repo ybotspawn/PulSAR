@@ -13,4 +13,5 @@ public class DebugObject
     public long[] AttentionMask {get; set;}
 
     public Dictionary<string, OrtValue> TensorValueInputs {get; set;}
+
 }

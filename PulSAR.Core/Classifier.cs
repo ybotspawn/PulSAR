@@ -9,6 +9,8 @@ using Microsoft.ML.Tokenizers;
 using System;
 using System.Diagnostics;
 using PulSAR.Core;
+using System.Reflection.Emit;
+using System.Text;
 
 public class Classifier
 {
@@ -87,14 +89,127 @@ public class Classifier
         
         dObject.TensorValueInputs = inputs;
 
-        // Create an InferenceSession from the Model Path.
-        // Creating and loading sessions are expensive per request.
-        // They better be cached
-        //InferenceSession session = new InferenceSession(model_path + "model.onnx");
-        //PrintModelMetaData for model metadata/Example 1
-        //PrintModelMetaData(session);
+        // Build the inference session
+        using var session    = new InferenceSession($"{model_path}model.onnx");  // create once and reuse in real code
+        
+        // Basic empty run options - why just because we might do stuff with it later
+        using var runOptions = new RunOptions();
 
-        PrintDebugInfo(dObject);
+        // Get the results of the inference session with our inputs and session Outputnames
+        using var results    = session.Run(runOptions, inputs, session.OutputNames);
+
+        // Logits show the scoring before we characterize them as an actual percentage
+        ReadOnlySpan<float> logits = results[0].GetTensorDataAsSpan<float>();
+
+        System.Console.WriteLine("Logits");
+        foreach (var item in logits)
+        {
+            System.Console.WriteLine($"\t{item.ToString()}");
+        }
+
+        string[] id2label = { "O", "B-MISC", "I-MISC", "B-PER", "I-PER",
+                      "B-ORG", "I-ORG", "B-LOC", "I-LOC" };
+        const int numLabels = 9;
+
+        List<Word> words = new List<Word>();
+
+        for (int t = 1; t < n - 1; t++)              // skip [CLS] and [SEP]
+        {
+            ReadOnlySpan<float> row = logits.Slice(t * numLabels, numLabels);
+            Span<float> softMaxRow = new Span<float>(row.ToArray()); //make this 9 as the number of labels
+            System.Numerics.Tensors.TensorPrimitives.SoftMax(row, softMaxRow);
+
+            System.Console.Write($"\tSlice start -> Length: {t*numLabels} -> {numLabels} | \t");
+            int best = 0;
+            for (int k = 1; k < numLabels; k++) {
+                if (row[k] > row[best]) best = k;
+                if (softMaxRow[k] > softMaxRow[best]) best = k;
+            }
+
+            EncodedToken tok = tokens[t - 1];        // shift back past [CLS]
+
+            Console.Write($"{tok.Value,-12} {id2label[best],-7} chars {tok.Offset.Start.Value}-{tok.Offset.End.Value} softmax ");
+            LabelId testLabel = (LabelId)best;
+            System.Console.WriteLine($"Label: {best} Confidence: {softMaxRow[best]} LabelId: {testLabel}");
+            
+
+            if (!tok.Value.StartsWith("##"))
+            {
+                words.Add(new Word()
+                {
+                    startIndex = tok.Offset.Start.Value,
+                    endIndex = tok.Offset.End.Value,
+                    bestLabel = new Label
+                    {
+                        label = (LabelId) best,
+                        probability = softMaxRow[best]
+                    },
+                    tokens = new List<WordToken>()
+                    {
+                        new WordToken()
+                        {
+                            startIndex = tok.Offset.Start.Value,
+                            endIndex = tok.Offset.End.Value,
+                            token = tok.Value,
+                            label = new Label
+                            {
+                                label = (LabelId) best,
+                                probability = softMaxRow[best]
+                            }
+                        }
+                    },
+                    wordBuilder = new StringBuilder(tok.Value)
+                });
+            }
+            else // this will need to accomodatelastordefault style checking or throw an exception saying an error with input
+            {
+                var w = words.Last();
+                Label tokenLabel = new Label
+                {
+                    label = (LabelId) best,
+                    probability = softMaxRow[best]
+                };
+
+                words.Last()
+                    .wordBuilder.Append(tok.Value.Replace("##", ""));
+                
+                words.Last().tokens.Add(new WordToken()
+                        {
+                            startIndex = tok.Offset.Start.Value,
+                            endIndex = tok.Offset.End.Value,
+                            token = tok.Value,
+                            label = tokenLabel
+                        });
+
+                if (words.Last().bestLabel.probability < softMaxRow[best] && (LabelId)best != LabelId.NONE)
+                {
+                    words.Last().bestLabel = tokenLabel;
+                }
+                words.Last().endIndex = tok.Offset.End.Value;
+            }
+        }
+        
+        System.Console.WriteLine("Words");
+        foreach (var w in words)
+        {
+            System.Console.WriteLine($"\t{w.wordBuilder.ToString()} --- {(LabelId)w.bestLabel.label} --- {w.bestLabel.probability} --- Start: {w.startIndex} -> {w.endIndex}");
+        }
+        // PrintDebugInfo(dObject);
+    }
+
+    private static void GetSoftMaxValues(ReadOnlySpan<float> row, int numLabels)
+    {
+        Span<float> softMaxRow = new Span<float>(row.ToArray()); //make this 9 as the number of labels
+        System.Numerics.Tensors.TensorPrimitives.SoftMax(row, softMaxRow);
+
+        int best = 0;
+        for (int k = 1; k < numLabels; k++)
+            if (softMaxRow[k] > softMaxRow[best]) best = k;
+
+        System.Console.WriteLine($"Label: {best} Confidence: {softMaxRow[best]}");
+        // numLabels where labels is 9 labels, --- From id2Label array
+        // best = the best label that applies; 
+        // B-PER is Label 3
     }
 
     private static void PrintDebugInfo(DebugObject dObject) // [Issue] add DI to various functions like this, even though its just a helper function right now
@@ -106,15 +221,17 @@ public class Classifier
         {
             System.Console.WriteLine($"\t{iId.ToString()}");
         }
-        System.Console.WriteLine("Attention Mask:");
-        foreach (long aMask in dObject.AttentionMask)
-        {
-            System.Console.WriteLine($"\t{aMask.ToString()}");
-        }
-        System.Console.WriteLine("Tensor values:");
-        foreach (var item in dObject.TensorValueInputs)
-        {
-            System.Console.WriteLine($"{item.Key}");
-        }
+        // System.Console.WriteLine("Attention Mask:");
+        // foreach (long aMask in dObject.AttentionMask)
+        // {
+        //     System.Console.WriteLine($"\t{aMask.ToString()}");
+        // }
+        // System.Console.WriteLine("Tensor values:");
+        // foreach (var item in dObject.TensorValueInputs)
+        // {
+        //     System.Console.WriteLine($"{item.Key} - {item.Value.ToString()}"); // not really useful, but just leaving it here for now
+        // }
+
+        
     }
 }
