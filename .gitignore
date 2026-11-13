@@ -431,3 +431,4 @@ Extra/*
 .DS_Store
 PulSAR.Core/model_export.py
 PulSAR.models/*
+Notes.txt
