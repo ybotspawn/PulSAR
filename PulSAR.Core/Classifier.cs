@@ -11,10 +11,15 @@ using System.Diagnostics;
 using PulSAR.Core;
 using System.Reflection.Emit;
 using System.Text;
+using System.Net;
 
 public class Classifier
 {
 
+    public static string[] id2label = { "O", "B-MISC", "I-MISC", "B-PER", "I-PER",
+                      "B-ORG", "I-ORG", "B-LOC", "I-LOC" };
+    public const int numLabels = 9;
+    public static int internalDebug  = 0;
     public static string ybot = "My ybot library is functioning";
     private static string model_path = "/Users/mattwood/repos/git/ybotspawn/PulSAR/PulSAR.models/";
     public Classifier ()
@@ -33,8 +38,10 @@ public class Classifier
 
     }
 
-    public static void ClassifyText (string text)
+    public static void ClassifyText (string text, int debug_enabled = 0)
     {
+        internalDebug = debug_enabled;
+
         DebugObject dObject = new DebugObject();
         // Create the tokenizer 
         var tokenizer = BertTokenizer.Create($"{model_path}vocab.txt", new BertOptions
@@ -50,30 +57,30 @@ public class Classifier
         IReadOnlyList<EncodedToken> tokens = tokenizer.EncodeToTokens(clean, out var normalized);
 
         // [Issue] - Create a mechanism to chunk the inputs so we never bust the limit of our proposed model 510
-        int n = tokens.Count + 2;                    // + [CLS] + [SEP]; must be <= 512
-        long[] inputIds      = new long[n];  
-        long[] attentionMask = new long[n];
-        long[] tokenTypeIds  = new long[n];          // all 0 = one sentence
+        int actualTokenCount = tokens.Count + 2;                    // + [CLS] + [SEP]; must be <= 512
+        long[] inputIds      = new long[actualTokenCount];  
+        long[] attentionMask = new long[actualTokenCount];
+        long[] tokenTypeIds  = new long[actualTokenCount];          // all 0 = one sentence
 
-        dObject.TokenCount = n;
+        dObject.TokenCount = actualTokenCount;
         
 
         // Map our tokens to the actual inputIDs from vocab - this lets us identify our targets for redaction later
         inputIds[0] = tokenizer.ClassificationTokenId;          // [CLS], id 101
         for (int i = 0; i < tokens.Count; i++)
             inputIds[i + 1] = tokens[i].Id;
-        inputIds[n - 1] = tokenizer.SeparatorTokenId;           // [SEP], id 102
+        inputIds[actualTokenCount - 1] = tokenizer.SeparatorTokenId;           // [SEP], id 102
 
         // For each token in tokens assign an attentionMask of 1 (Real token) or 0 if its just padding
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < actualTokenCount; i++)
             attentionMask[i] = 1;                    // 1 = real token, 0 = padding
 
         dObject.InputIDs = inputIds;
         dObject.AttentionMask = attentionMask;
         
         // Tensor 
-        // build the shape of the tensor in this case 1 x tokenCount aka 'n'
-        long[] shape = { 1, n };
+        // build the shape of the tensor in this case 1 x tokenCount aka 'actualTokenCount'
+        long[] shape = { 1, actualTokenCount };
         // Creating the tensor based on the values of the array sizing above, which in turn is derived from the data provided to us (clean text)
         using var idsValue  = OrtValue.CreateTensorValueFromMemory(inputIds, shape);
         using var maskValue = OrtValue.CreateTensorValueFromMemory(attentionMask, shape);
@@ -101,25 +108,50 @@ public class Classifier
         // Logits show the scoring before we characterize them as an actual percentage
         ReadOnlySpan<float> logits = results[0].GetTensorDataAsSpan<float>();
 
-        System.Console.WriteLine("Logits");
+        DebugPrint("Logits");
         foreach (var item in logits)
         {
-            System.Console.WriteLine($"\t{item.ToString()}");
+            DebugPrint($"\t{item.ToString()}");
         }
 
-        string[] id2label = { "O", "B-MISC", "I-MISC", "B-PER", "I-PER",
-                      "B-ORG", "I-ORG", "B-LOC", "I-LOC" };
-        const int numLabels = 9;
+        List<Word> words = GetWords(actualTokenCount, logits, tokens);
+        List<Name> names = PopulateNames(words);
 
+        System.Console.WriteLine(names.Count);
+        foreach (var n in names)
+        {
+            string fullName = "";
+            foreach (var w in n.properNames)
+            {
+                if (w.wordBuilder.ToString().Equals("'"))
+                {
+                    fullName = fullName.Trim();
+                    fullName = $"{fullName}{w.wordBuilder.ToString()}";
+                }
+                else
+                    fullName = $"{fullName}{w.wordBuilder.ToString()} ";
+            }
+            fullName = fullName.Trim();
+            System.Console.WriteLine($"Full proper name: {fullName} --- Start: {n.StartIndex} -> {n.EndIndex}");
+        }
+        
+        //names.ForEach(n => n.properNames.ForEach(w =>System.Console.WriteLine($"Full Proper Name: {w.wordBuilder.ToString()} --- Start: {n.StartIndex} -> {n.EndIndex}")));
+        // PrintDebugInfo(dObject);
+        System.Console.WriteLine($"Actual Text: {text}");
+    }   
+
+
+    private static List<Word> GetWords(int actualTokenCount, ReadOnlySpan<float> logits, IReadOnlyList<EncodedToken> tokens)
+    {
         List<Word> words = new List<Word>();
 
-        for (int t = 1; t < n - 1; t++)              // skip [CLS] and [SEP]
+        for (int t = 1; t < actualTokenCount - 1; t++)              // skip [CLS] and [SEP]
         {
-            ReadOnlySpan<float> row = logits.Slice(t * numLabels, numLabels);
+            ReadOnlySpan<float> row = logits.Slice(t * numLabels, numLabels); // EXPLAIN THIS
             Span<float> softMaxRow = new Span<float>(row.ToArray()); //make this 9 as the number of labels
             System.Numerics.Tensors.TensorPrimitives.SoftMax(row, softMaxRow);
 
-            System.Console.Write($"\tSlice start -> Length: {t*numLabels} -> {numLabels} | \t");
+            DebugPrint($"\tSlice start -> Length: {t*numLabels} -> {numLabels} | \t");
             int best = 0;
             for (int k = 1; k < numLabels; k++) {
                 if (row[k] > row[best]) best = k;
@@ -128,9 +160,9 @@ public class Classifier
 
             EncodedToken tok = tokens[t - 1];        // shift back past [CLS]
 
-            Console.Write($"{tok.Value,-12} {id2label[best],-7} chars {tok.Offset.Start.Value}-{tok.Offset.End.Value} softmax ");
+            DebugPrint($"{tok.Value,-12} {id2label[best],-7} chars {tok.Offset.Start.Value}-{tok.Offset.End.Value} softmax ");
             LabelId testLabel = (LabelId)best;
-            System.Console.WriteLine($"Label: {best} Confidence: {softMaxRow[best]} LabelId: {testLabel}");
+            DebugPrint($"Label: {best} Confidence: {softMaxRow[best]} LabelId: {testLabel}");
             
 
             if (!tok.Value.StartsWith("##"))
@@ -188,13 +220,39 @@ public class Classifier
                 words.Last().endIndex = tok.Offset.End.Value;
             }
         }
-        
+
+        return words;
+    }
+
+    private static void DebugPrint(string text)
+    {
+        if (internalDebug == 1)
+        {
+            System.Console.WriteLine(text);
+        }
+    }
+
+    private static List<Name> PopulateNames(List<Word> words)
+    {
+        List<Name> documentOrderedNames = new List<Name>();
         System.Console.WriteLine("Words");
         foreach (var w in words)
         {
-            System.Console.WriteLine($"\t{w.wordBuilder.ToString()} --- {(LabelId)w.bestLabel.label} --- {w.bestLabel.probability} --- Start: {w.startIndex} -> {w.endIndex}");
+            if (w.bestLabel.label == LabelId.BPER)
+            {
+                System.Console.WriteLine($"\t{w.wordBuilder.ToString()} --- {(LabelId)w.bestLabel.label} --- {w.bestLabel.probability} --- Start: {w.startIndex} -> {w.endIndex}");
+                documentOrderedNames.Add(new Name()
+                {
+                    properNames = new List<Word>(){ w }
+                });
+            }
+            else if (w.bestLabel.label == LabelId.IPER)
+            {
+                System.Console.WriteLine($"\t{w.wordBuilder.ToString()} --- {(LabelId)w.bestLabel.label} --- {w.bestLabel.probability} --- Start: {w.startIndex} -> {w.endIndex}");
+                documentOrderedNames.Last()?.properNames.Add(w);
+            }
         }
-        // PrintDebugInfo(dObject);
+        return documentOrderedNames;
     }
 
     private static void GetSoftMaxValues(ReadOnlySpan<float> row, int numLabels)
@@ -214,12 +272,12 @@ public class Classifier
 
     private static void PrintDebugInfo(DebugObject dObject) // [Issue] add DI to various functions like this, even though its just a helper function right now
     {
-        System.Console.WriteLine(dObject.TokenCount);
-        System.Console.WriteLine(dObject.CleanText);
-        System.Console.WriteLine("Input Ids:");
+        DebugPrint(dObject.TokenCount.ToString());
+        DebugPrint(dObject.CleanText);
+        DebugPrint("Input Ids:");
         foreach (long iId in dObject.InputIDs)
         {
-            System.Console.WriteLine($"\t{iId.ToString()}");
+            DebugPrint($"\t{iId.ToString()}");
         }
         // System.Console.WriteLine("Attention Mask:");
         // foreach (long aMask in dObject.AttentionMask)
