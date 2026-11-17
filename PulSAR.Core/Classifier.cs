@@ -9,6 +9,7 @@ using Microsoft.ML.Tokenizers;
 using System;
 using System.Diagnostics;
 using PulSAR.Core;
+using PulSAR.Core.Extensions;
 using System.Reflection.Emit;
 using System.Text;
 using System.Net;
